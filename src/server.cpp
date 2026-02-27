@@ -5,6 +5,7 @@
 #include <sys/socket.h>         //socket(),bind(),listen(),accept()
 #include <netinet/in.h>         //struct sockaddr_in for ip/port numbers
 #include <unistd.h>             //linux sys call utilities - close()
+#include <thread>
 
 Server::Server(int port):port(port),server_fd(-1){}
 
@@ -55,7 +56,7 @@ struct in_addr {
 void Server::start(){
     setupSocket();
 
-    while(true){
+    while(running){
         std::cout<<"Waiting for a client to connect...\n";
 
         /*
@@ -72,8 +73,20 @@ void Server::start(){
         }
         std::cout<<"Client connected\n";
 
-        handleClient(client_fd);
-        close(client_fd);
+        //handleClient(client_fd); //handle client in the main thread
+        //thread() handleClient() in a separate thread to allow multiple clients to connect simultaneously
+        //std::thread(&Server::handleClient,this,client_fd).detach();
+        workers.emplace_back(&Server::handleClient,this,client_fd);
+    }
+}
+
+void Server::stop(){
+    running = false;
+    close(server_fd);
+    for(auto& worker : workers){
+        if(worker.joinable()){
+            worker.join();
+        }
     }
 }
 
@@ -89,8 +102,6 @@ void Server::handleClient(int client_fd){
     "Content-Length: "+std::to_string(body.size())+"\r\n"
     "\r\n" +
     body;
-
-    sleep(5); 
 
     send(client_fd, response.c_str(), response.length(), 0);
     close(client_fd);
