@@ -6,7 +6,7 @@ Server* globalServer = nullptr;
 
 int main(){
     try{
-        Server server(8080);
+        Server server(8080, 4);
         globalServer = &server;
 
         // Handle SIGINT (Ctrl+C) to gracefully shut down the server

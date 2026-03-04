@@ -7,7 +7,7 @@
 #include <unistd.h>             //linux sys call utilities - close()
 #include <thread>
 
-Server::Server(int port):port(port),server_fd(-1){}
+Server::Server(int port, int threadCount):port(port),server_fd(-1),threadCount(threadCount){}
 
 void Server::setupSocket(){
     //socket() give me a TCP socket, AF_INET for IPv4, SOCK_STREAM for TCP, 0 for default protocol
@@ -54,6 +54,10 @@ struct in_addr {
 }
 
 void Server::start(){
+    for(int i=0;i<threadCount;i++){
+        std::cout<<"Worker thread "<<i<<" started\n";
+        workers.emplace_back(&Server::workerLoop,this); 
+    }
     setupSocket();
 
     while(running){
@@ -62,7 +66,7 @@ void Server::start(){
         /*
         accept() :
         blocks until a client connects, 
-        then returns a new socket file descriptor for the connection.
+        then returns a new socket file descriptor for the client.
         The original server_fd continues to listen for new connections, 
         while the returned client_fd is used for communication with the connected client.
         */
@@ -73,16 +77,36 @@ void Server::start(){
         }
         std::cout<<"Client connected\n";
 
-        //handleClient(client_fd); //handle client in the main thread
-        //thread() handleClient() in a separate thread to allow multiple clients to connect simultaneously
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+
+            if(taskQueue.size() > 1000){
+                close(client_fd);
+                continue;
+            }
+        }
+
+        taskQueue.push(client_fd);
+        cv.notify_one(); 
+
+        //v0.1//handleClient(client_fd); //handle client in the main thread
+
+        //v0.2//thread() handleClient() in a separate thread to allow multiple clients to connect simultaneously
         //std::thread(&Server::handleClient,this,client_fd).detach();
-        workers.emplace_back(&Server::handleClient,this,client_fd);
+
+        //v0.2 + gracefull shutdown 
+        //workers.emplace_back(&Server::handleClient,this,client_fd);
+
+        //v0.3 + worker loop to handle clients in a thread pool manner
     }
 }
 
 void Server::stop(){
     running = false;
     close(server_fd);
+    
+    shutDown = true;
+    cv.notify_all(); 
     for(auto& worker : workers){
         if(worker.joinable()){
             worker.join();
@@ -105,4 +129,24 @@ void Server::handleClient(int client_fd){
 
     send(client_fd, response.c_str(), response.length(), 0);
     close(client_fd);
+}
+
+void Server::workerLoop(){
+    while (true) {
+        std::unique_lock<std::mutex> lock(queueMutex);
+        cv.wait(lock, [this] { return !taskQueue.empty() || shutDown; });
+        
+        if (shutDown && taskQueue.empty()) 
+            break;
+        
+        int client_fd = taskQueue.front();
+        taskQueue.pop();
+        lock.unlock();
+
+        std::cout<<"Worker "
+                <<std::this_thread::get_id()
+                <<" handling client\n";
+
+        handleClient(client_fd);
+    }
 }
