@@ -2,21 +2,25 @@
 
 #include <iostream>
 #include <cstring>
+#include <stdexcept>
+
 #include <sys/socket.h>         //socket(),bind(),listen(),accept()
 #include <netinet/in.h>         //struct sockaddr_in for ip/port numbers
 #include <unistd.h>             //linux sys call utilities - close()
-#include <thread>
 
-Server::Server(int port, int threadCount):port(port),server_fd(-1),threadCount(threadCount){}
+#include <sys/epoll.h>            
+#include <fcntl.h>              
+
+Server::Server(int port):port(port),server_fd(-1){}
 
 void Server::setupSocket(){
-    //socket() give me a TCP socket, AF_INET for IPv4, SOCK_STREAM for TCP, 0 for default protocol
+    //socket() give a TCP socket, AF_INET for IPv4, SOCK_STREAM for TCP, 0 for default protocol
     server_fd = socket(AF_INET, SOCK_STREAM,0);
     if(server_fd==-1){
         throw std::runtime_error("Socket creation failed");
     }
 
-    //setsockopt() to allow reuse of the address and port
+    //setsockopt() allow reuse of the address and port
     int opt = 1;
     if(setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt)) < 0){
         throw std::runtime_error("setsockopt failed");
@@ -40,78 +44,75 @@ struct in_addr {
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(port);
 
-    //bind() attach the socket to the port and IP address specified in sockaddr_in
     if(bind(server_fd,(struct sockaddr*)&address ,sizeof(address)) < 0){
         throw std::runtime_error("Bind failed");
     }
 
-    //listen() start queueing incoming connections, 5 is the max number of pending connections
-    if(listen(server_fd,5) < 0){
+    if(listen(server_fd,SOMAXCONN) < 0){
         throw std::runtime_error("Listen failed");
     }
+
+    fcntl(server_fd, F_SETFL, O_NONBLOCK);
 
     std::cout<<"server listening on port "<<port<<"\n";
 }
 
+//---------server socket setup finished--------
+//---------------client handling----------------
+
 void Server::start(){
-    for(int i=0;i<threadCount;i++){
-        std::cout<<"Worker thread "<<i<<" started\n";
-        workers.emplace_back(&Server::workerLoop,this); 
-    }
     setupSocket();
 
+    epoll_fd = epoll_create1(0);
+    if(epoll_fd == -1){
+        throw std::runtime_error("Failed to create epoll instance");
+    }
+
+    struct epoll_event ev{};
+    ev.events = EPOLLIN;
+    ev.data.fd = server_fd;
+    if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev) == -1){
+        throw std::runtime_error("Failed to add server socket to epoll");
+    }
+
+    struct epoll_event events[MAX_EVENTS];
     while(running){
         std::cout<<"Waiting for a client to connect...\n";
 
-        /*
-        accept() :
-        blocks until a client connects, 
-        then returns a new socket file descriptor for the client.
-        The original server_fd continues to listen for new connections, 
-        while the returned client_fd is used for communication with the connected client.
-        */
-        int client_fd = accept(server_fd,nullptr,nullptr);
-        if(client_fd < 0){
-            std::cerr<<"Accept failed\n";
-            continue;
+        int n = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
+        if(n == -1){
+            if(errno == EINTR){
+                continue; // Interrupted by signal, check running flag again
+            }
+            std::cerr<<"Epoll wait failed\n";
+            break;
         }
-        std::cout<<"Client connected\n";
 
-        {
-            std::lock_guard<std::mutex> lock(queueMutex);
+        for(int i=0; i<n; i++){
+            int fd=events[i].data.fd;
+            if(fd == server_fd){
+                int client_fd = accept(server_fd,nullptr,nullptr);
+                fcntl(client_fd, F_SETFL, O_NONBLOCK);
 
-            if(taskQueue.size() > 1000){
-                close(client_fd);
-                continue;
+                ev.events = EPOLLIN;
+                ev.data.fd = client_fd;
+                if(epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &ev) == -1){
+                    std::cerr<<"Failed to add client socket to epoll\n";
+                    close(client_fd);
+                    continue;
+                }else{
+                    std::cout<<"New client connected, fd: "<<client_fd<<"\n";
+                    handleClient(client_fd);
+                }
             }
         }
-
-        taskQueue.push(client_fd);
-        cv.notify_one(); 
-
-        //v0.1//handleClient(client_fd); //handle client in the main thread
-
-        //v0.2//thread() handleClient() in a separate thread to allow multiple clients to connect simultaneously
-        //std::thread(&Server::handleClient,this,client_fd).detach();
-
-        //v0.2 + gracefull shutdown 
-        //workers.emplace_back(&Server::handleClient,this,client_fd);
-
-        //v0.3 + worker loop to handle clients in a thread pool manner
     }
 }
 
 void Server::stop(){
     running = false;
     close(server_fd);
-    
-    shutDown = true;
-    cv.notify_all(); 
-    for(auto& worker : workers){
-        if(worker.joinable()){
-            worker.join();
-        }
-    }
+    close(epoll_fd);
 }
 
 void Server::handleClient(int client_fd){
@@ -129,24 +130,4 @@ void Server::handleClient(int client_fd){
 
     send(client_fd, response.c_str(), response.length(), 0);
     close(client_fd);
-}
-
-void Server::workerLoop(){
-    while (true) {
-        std::unique_lock<std::mutex> lock(queueMutex);
-        cv.wait(lock, [this] { return !taskQueue.empty() || shutDown; });
-        
-        if (shutDown && taskQueue.empty()) 
-            break;
-        
-        int client_fd = taskQueue.front();
-        taskQueue.pop();
-        lock.unlock();
-
-        std::cout<<"Worker "
-                <<std::this_thread::get_id()
-                <<" handling client\n";
-
-        handleClient(client_fd);
-    }
 }
